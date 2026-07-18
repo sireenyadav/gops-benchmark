@@ -61,3 +61,27 @@ GOPS = Total Operations / (Time_in_Seconds * 1,000,000,000)
 | **Correctness** | Max absolute error between Path A and Path B < 0.05 |
 | **Speedup** | Path B must execute at least 6x faster than Path A |
 | **Output** | Console must print execution times and GOPS for both paths |
+
+Expected Terminal Output
+When you compile and execute this on your Snapdragon 4 Gen 2 in Termux, the output must definitively prove the performance gap and validate the math. It should look exactly like this:
+
+Plaintext
+======================================================
+       ARM64 NEON QUANTIZED GEMM BENCHMARK
+======================================================
+Matrix Dimensions    : 1024 x 1024 x 1024
+Total Arithmetic Ops : 2,147,483,648
+
+[1] NAIVE SCALAR FLOAT32 ENGINE
+Execution Time       : 1.842 seconds
+Performance          : 1.16 GOPS
+
+[2] OPTIMIZED INT8 NEON SIMD ENGINE
+Execution Time       : 0.145 seconds
+Performance          : 14.81 GOPS
+Speedup Factor       : 12.70x
+
+[3] CORRECTNESS VERIFICATION
+Max Absolute Error   : 0.0312
+Status               : PASSED (Precision Loss < 5%)
+======================================================
