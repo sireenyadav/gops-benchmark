@@ -1,246 +1,294 @@
-#include <iostream>
-#include <vector>
-#include <chrono>
-#include <cmath>
-#include <iomanip>
-#include <cstdlib>
-#include <cstring>
+```cpp
 #include <arm_neon.h>
 
-constexpr int M = 1024, K = 1024, N = 1024;
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <thread>
+#include <vector>
 
-void init_matrix(std::vector<float>& mat, int size) {
-    for (int i = 0; i < size; ++i)
-        mat[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * 2.0f - 1.0f;
+using steady_clock = std::chrono::steady_clock;
+
+constexpr int M = 1024;
+constexpr int K = 1024;
+constexpr int N = 1024;
+
+// Tune this:
+// 32 is a good balance for accuracy/speed.
+// 16 gives better accuracy, 64 may be faster on some cores.
+constexpr int K_BLOCK = 32;
+constexpr int K_BLOCKS = K / K_BLOCK;
+
+static_assert(K % K_BLOCK == 0, "K must be divisible by K_BLOCK");
+static_assert(N % 4 == 0, "N must be divisible by 4");
+static_assert(K % 16 == 0, "K must be divisible by 16 for vdotq loops");
+
+static inline int32_t hsum_s32(int32x4_t v) {
+#if defined(__aarch64__)
+    return vaddvq_s32(v);
+#else
+    int32x2_t s = vadd_s32(vget_low_s32(v), vget_high_s32(v));
+    s = vpadd_s32(s, s);
+    return vget_lane_s32(s, 0);
+#endif
 }
 
-// Naive float32 (unchanged)
-void gemm_float32(const std::vector<float>& A, const std::vector<float>& B,
-                  std::vector<float>& C) {
-    for (int i = 0; i < M; ++i)
+static inline float rand_uniform_float(std::mt19937 &rng) {
+    static thread_local std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    return dist(rng);
+}
+
+void init_matrix(std::vector<float> &mat) {
+    std::mt19937 rng(42);
+    for (auto &x : mat) x = rand_uniform_float(rng);
+}
+
+void gemm_float32(const std::vector<float> &A,
+                  const std::vector<float> &B,
+                  std::vector<float> &C) {
+    for (int i = 0; i < M; ++i) {
+        const float *a = A.data() + i * K;
         for (int j = 0; j < N; ++j) {
             float sum = 0.0f;
-            for (int k = 0; k < K; ++k)
-                sum += A[i * K + k] * B[k * N + j];
+            for (int k = 0; k < K; ++k) {
+                sum += a[k] * B[k * N + j];
+            }
             C[i * N + j] = sum;
         }
+    }
 }
 
-// ----- Per-row quantization of A (row scales) -----
-void quantize_A_per_row(const std::vector<float>& A, int8_t* A_int8,
-                        std::vector<float>& scales_A) {
+void quantize_A_blockwise(const std::vector<float> &A,
+                          std::vector<int8_t> &Aq,
+                          std::vector<float> &A_scales) {
+    Aq.resize(M * K);
+    A_scales.resize(M * K_BLOCKS);
+
     for (int i = 0; i < M; ++i) {
-        const float* row = A.data() + i * K;
-        float max_abs = 0.0f;
-        for (int k = 0; k < K; ++k)
-            max_abs = std::max(max_abs, std::abs(row[k]));
-        float scale = max_abs / 127.0f;
-        scales_A[i] = scale;
-        float inv_scale = 1.0f / scale;
-        for (int k = 0; k < K; ++k) {
-            float q = std::round(row[k] * inv_scale);
-            q = std::max(-127.0f, std::min(127.0f, q));
-            A_int8[i * K + k] = static_cast<int8_t>(q);
+        const float *row = A.data() + i * K;
+        for (int blk = 0; blk < K_BLOCKS; ++blk) {
+            const int k0 = blk * K_BLOCK;
+            float max_abs = 0.0f;
+            for (int k = 0; k < K_BLOCK; ++k) {
+                max_abs = std::max(max_abs, std::fabs(row[k0 + k]));
+            }
+
+            float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            A_scales[i * K_BLOCKS + blk] = scale;
+            const float inv = 1.0f / scale;
+
+            for (int k = 0; k < K_BLOCK; ++k) {
+                float q = std::round(row[k0 + k] * inv);
+                q = std::max(-127.0f, std::min(127.0f, q));
+                Aq[i * K + k0 + k] = static_cast<int8_t>(q);
+            }
         }
     }
 }
 
-// ----- Per-column quantization of B (column scales) -----
-void quantize_B_per_column(const std::vector<float>& B, int8_t* B_int8,
-                           std::vector<float>& scales_B) {
+// Store B transposed in column-major form:
+// B_T[j * K + k] = B[k * N + j]
+void quantize_B_blockwise_transposed(const std::vector<float> &B,
+                                     std::vector<int8_t> &BqT,
+                                     std::vector<float> &B_scales) {
+    BqT.resize(N * K);
+    B_scales.resize(N * K_BLOCKS);
+
     for (int j = 0; j < N; ++j) {
-        float max_abs = 0.0f;
-        for (int k = 0; k < K; ++k)
-            max_abs = std::max(max_abs, std::abs(B[k * N + j]));
-        float scale = max_abs / 127.0f;
-        scales_B[j] = scale;
-        float inv_scale = 1.0f / scale;
-        for (int k = 0; k < K; ++k) {
-            float q = std::round(B[k * N + j] * inv_scale);
-            q = std::max(-127.0f, std::min(127.0f, q));
-            B_int8[k * N + j] = static_cast<int8_t>(q);
-        }
-    }
-}
+        for (int blk = 0; blk < K_BLOCKS; ++blk) {
+            const int k0 = blk * K_BLOCK;
+            float max_abs = 0.0f;
+            for (int k = 0; k < K_BLOCK; ++k) {
+                max_abs = std::max(max_abs, std::fabs(B[(k0 + k) * N + j]));
+            }
 
-// ----- Pack A: replicate each 4-byte group 4 times (for 4 outputs per vdotq) -----
-void pack_A_vdot(const int8_t* A, int8_t* A_packed) {
-    for (int i = 0; i < M; ++i) {
-        const int8_t* src = A + i * K;
-        int8_t* dst = A_packed + i * (K * 4);
-        for (int k0 = 0; k0 < K; k0 += 4) {
-            for (int rep = 0; rep < 4; ++rep) {
-                std::memcpy(dst, src + k0, 4);
-                dst += 4;
+            float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            B_scales[j * K_BLOCKS + blk] = scale;
+            const float inv = 1.0f / scale;
+
+            for (int k = 0; k < K_BLOCK; ++k) {
+                float x = B[(k0 + k) * N + j];
+                float q = std::round(x * inv);
+                q = std::max(-127.0f, std::min(127.0f, q));
+                BqT[j * K + (k0 + k)] = static_cast<int8_t>(q);
             }
         }
     }
 }
 
-// ----- Pack B: interleave 4 columns per k-block of 4 bytes -----
-void pack_B_vdot(const int8_t* B_T, int8_t* B_packed) {
-    constexpr int JG = N / 4;
-    for (int jg = 0; jg < JG; ++jg) {
-        int8_t* dst = B_packed + jg * (K * 4);
-        for (int k0 = 0; k0 < K; k0 += 4) {
-            for (int jj = 0; jj < 4; ++jj) {
-                const int8_t* col = B_T + (jg * 4 + jj) * K + k0;
-                std::memcpy(dst, col, 4);
-                dst += 4;
+void gemm_int8_neon_blockwise_mt(const std::vector<int8_t> &Aq,
+                                 const std::vector<float> &A_scales,
+                                 const std::vector<int8_t> &BqT,
+                                 const std::vector<float> &B_scales,
+                                 std::vector<float> &C,
+                                 int num_threads) {
+#if !defined(__aarch64__) || !defined(__ARM_FEATURE_DOTPROD)
+    std::cerr << "This build needs AArch64 with dotprod support (vdotq_s32).\n";
+    std::exit(1);
+#endif
+
+    auto worker = [&](int row_begin, int row_end) {
+        for (int i = row_begin; i < row_end; ++i) {
+            const int8_t *a_row = Aq.data() + i * K;
+            const float  *a_scl = A_scales.data() + i * K_BLOCKS;
+            float *c_row = C.data() + i * N;
+
+            for (int jg = 0; jg < N / 4; ++jg) {
+                const int j0 = jg * 4;
+
+                const int8_t *b0 = BqT.data() + (j0 + 0) * K;
+                const int8_t *b1 = BqT.data() + (j0 + 1) * K;
+                const int8_t *b2 = BqT.data() + (j0 + 2) * K;
+                const int8_t *b3 = BqT.data() + (j0 + 3) * K;
+
+                const float *bs0 = B_scales.data() + (j0 + 0) * K_BLOCKS;
+                const float *bs1 = B_scales.data() + (j0 + 1) * K_BLOCKS;
+                const float *bs2 = B_scales.data() + (j0 + 2) * K_BLOCKS;
+                const float *bs3 = B_scales.data() + (j0 + 3) * K_BLOCKS;
+
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+                for (int blk = 0; blk < K_BLOCKS; ++blk) {
+                    const int k0 = blk * K_BLOCK;
+
+                    int32x4_t sum0 = vdupq_n_s32(0);
+                    int32x4_t sum1 = vdupq_n_s32(0);
+                    int32x4_t sum2 = vdupq_n_s32(0);
+                    int32x4_t sum3 = vdupq_n_s32(0);
+
+                    // 32-byte block = 2 x 16-byte dotprod steps
+                    for (int t = 0; t < K_BLOCK; t += 16) {
+                        const int8x16_t a_vec = vld1q_s8(a_row + k0 + t);
+                        const int8x16_t bv0   = vld1q_s8(b0 + k0 + t);
+                        const int8x16_t bv1   = vld1q_s8(b1 + k0 + t);
+                        const int8x16_t bv2   = vld1q_s8(b2 + k0 + t);
+                        const int8x16_t bv3   = vld1q_s8(b3 + k0 + t);
+
+                        sum0 = vdotq_s32(sum0, a_vec, bv0);
+                        sum1 = vdotq_s32(sum1, a_vec, bv1);
+                        sum2 = vdotq_s32(sum2, a_vec, bv2);
+                        sum3 = vdotq_s32(sum3, a_vec, bv3);
+                    }
+
+                    const int32_t s0 = hsum_s32(sum0);
+                    const int32_t s1 = hsum_s32(sum1);
+                    const int32_t s2 = hsum_s32(sum2);
+                    const int32_t s3 = hsum_s32(sum3);
+
+                    const float sa = a_scl[blk];
+                    acc0 += static_cast<float>(s0) * sa * bs0[blk];
+                    acc1 += static_cast<float>(s1) * sa * bs1[blk];
+                    acc2 += static_cast<float>(s2) * sa * bs2[blk];
+                    acc3 += static_cast<float>(s3) * sa * bs3[blk];
+                }
+
+                c_row[j0 + 0] = acc0;
+                c_row[j0 + 1] = acc1;
+                c_row[j0 + 2] = acc2;
+                c_row[j0 + 3] = acc3;
             }
         }
+    };
+
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > M) num_threads = M;
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    const int rows_per_thread = (M + num_threads - 1) / num_threads;
+    for (int t = 0; t < num_threads; ++t) {
+        int row_begin = t * rows_per_thread;
+        int row_end = std::min(M, row_begin + rows_per_thread);
+        if (row_begin >= row_end) break;
+        threads.emplace_back(worker, row_begin, row_end);
     }
+
+    for (auto &th : threads) th.join();
 }
 
 int main() {
-    srand(42);   // fixed seed, reproducible
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
 
     std::vector<float> A(M * K), B(K * N);
-    std::vector<float> C_float(M * N, 0.0f), C_quant(M * N, 0.0f);
-    init_matrix(A, M * K);
-    init_matrix(B, K * N);
+    std::vector<float> C_ref(M * N, 0.0f), C_q(M * N, 0.0f);
 
-    // Path A – baseline
-    auto t0 = std::chrono::steady_clock::now();
-    gemm_float32(A, B, C_float);
-    auto t1 = std::chrono::steady_clock::now();
-    std::chrono::duration<double> time_f32 = t1 - t0;
+    init_matrix(A);
+    init_matrix(B);
 
-    // Quantize with per-row/column scales
-    int8_t *A_int8 = nullptr, *B_int8 = nullptr, *B_int8_T = nullptr;
-    posix_memalign(reinterpret_cast<void**>(&A_int8), 64, M * K);
-    posix_memalign(reinterpret_cast<void**>(&B_int8), 64, K * N);
-    posix_memalign(reinterpret_cast<void**>(&B_int8_T), 64, K * N);
+    const auto t0 = steady_clock::now();
+    gemm_float32(A, B, C_ref);
+    const auto t1 = steady_clock::now();
 
-    std::vector<float> row_scales_A(M), col_scales_B(N);
-    quantize_A_per_row(A, A_int8, row_scales_A);
-    quantize_B_per_column(B, B_int8, col_scales_B);
+    std::vector<int8_t> Aq, BqT;
+    std::vector<float> A_scales, B_scales;
 
-    // Transpose B (KxN -> NxK)
-    for (int i = 0; i < K; ++i)
-        for (int j = 0; j < N; ++j)
-            B_int8_T[j * K + i] = B_int8[i * N + j];
+    quantize_A_blockwise(A, Aq, A_scales);
+    quantize_B_blockwise_transposed(B, BqT, B_scales);
 
-    // Pack matrices
-    int8_t *A_packed = nullptr, *B_packed = nullptr;
-    posix_memalign(reinterpret_cast<void**>(&A_packed), 64, M * K * 4);
-    posix_memalign(reinterpret_cast<void**>(&B_packed), 64, N * K);
-    pack_A_vdot(A_int8, A_packed);
-    pack_B_vdot(B_int8_T, B_packed);
+    int num_threads = std::max(1u, std::thread::hardware_concurrency());
+    const auto t2 = steady_clock::now();
+    gemm_int8_neon_blockwise_mt(Aq, A_scales, BqT, B_scales, C_q, num_threads);
+    const auto t3 = steady_clock::now();
 
-    // Path B – accelerated NEON
-    auto t2 = std::chrono::steady_clock::now();
+    double time_f32 = std::chrono::duration<double>(t1 - t0).count();
+    double time_q   = std::chrono::duration<double>(t3 - t2).count();
 
-    constexpr int IBLOCK = 4;   // 4 rows of A at once
-    constexpr int JG = N / 4;   // groups of 4 columns
+    float max_abs_err = 0.0f;
+    float max_ref_abs = 0.0f;
+    float mean_abs_err = 0.0f;
 
-    for (int i = 0; i < M; i += IBLOCK) {
-        for (int jg = 0; jg < JG; ++jg) {
-            int32x4_t c0 = vdupq_n_s32(0);
-            int32x4_t c1 = vdupq_n_s32(0);
-            int32x4_t c2 = vdupq_n_s32(0);
-            int32x4_t c3 = vdupq_n_s32(0);
-
-            const int8_t* b_base = B_packed + jg * (K * 4);
-            const int8_t* a0 = A_packed + (i + 0) * (K * 4);
-            const int8_t* a1 = A_packed + (i + 1) * (K * 4);
-            const int8_t* a2 = A_packed + (i + 2) * (K * 4);
-            const int8_t* a3 = A_packed + (i + 3) * (K * 4);
-
-            // k‑loop unrolled by 2
-            for (int k_block = 0; k_block < K / 4; k_block += 2) {
-                int8x16_t b0 = vld1q_s8(b_base + (k_block + 0) * 16);
-                int8x16_t b1 = vld1q_s8(b_base + (k_block + 1) * 16);
-
-                int8x16_t a00 = vld1q_s8(a0 + (k_block + 0) * 16);
-                int8x16_t a01 = vld1q_s8(a0 + (k_block + 1) * 16);
-                c0 = vdotq_s32(c0, a00, b0);
-                c0 = vdotq_s32(c0, a01, b1);
-
-                int8x16_t a10 = vld1q_s8(a1 + (k_block + 0) * 16);
-                int8x16_t a11 = vld1q_s8(a1 + (k_block + 1) * 16);
-                c1 = vdotq_s32(c1, a10, b0);
-                c1 = vdotq_s32(c1, a11, b1);
-
-                int8x16_t a20 = vld1q_s8(a2 + (k_block + 0) * 16);
-                int8x16_t a21 = vld1q_s8(a2 + (k_block + 1) * 16);
-                c2 = vdotq_s32(c2, a20, b0);
-                c2 = vdotq_s32(c2, a21, b1);
-
-                int8x16_t a30 = vld1q_s8(a3 + (k_block + 0) * 16);
-                int8x16_t a31 = vld1q_s8(a3 + (k_block + 1) * 16);
-                c3 = vdotq_s32(c3, a30, b0);
-                c3 = vdotq_s32(c3, a31, b1);
-            }
-
-            // De‑quantize with per‑row/column scales and store
-            int32_t res[4];
-            float* c_out = C_quant.data();
-            float rs0 = row_scales_A[i + 0];
-            float rs1 = row_scales_A[i + 1];
-            float rs2 = row_scales_A[i + 2];
-            float rs3 = row_scales_A[i + 3];
-
-            vst1q_s32(res, c0);
-            for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 0) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs0 * col_scales_B[jg * 4 + jj];
-
-            vst1q_s32(res, c1);
-            for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 1) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs1 * col_scales_B[jg * 4 + jj];
-
-            vst1q_s32(res, c2);
-            for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 2) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs2 * col_scales_B[jg * 4 + jj];
-
-            vst1q_s32(res, c3);
-            for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 3) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs3 * col_scales_B[jg * 4 + jj];
-        }
-    }
-
-    auto t3 = std::chrono::steady_clock::now();
-    std::chrono::duration<double> time_int8 = t3 - t2;
-
-    // Verification
-    float max_abs_err = 0.0f, max_c_val = 0.0f;
     for (int i = 0; i < M * N; ++i) {
-        float err = std::abs(C_float[i] - C_quant[i]);
-        max_abs_err = std::max(max_abs_err, err);
-        max_c_val = std::max(max_c_val, std::abs(C_float[i]));
+        float diff = std::fabs(C_ref[i] - C_q[i]);
+        max_abs_err = std::max(max_abs_err, diff);
+        max_ref_abs = std::max(max_ref_abs, std::fabs(C_ref[i]));
+        mean_abs_err += diff;
     }
-    float rel_err_pct = (max_abs_err / max_c_val) * 100.0f;
+    mean_abs_err /= static_cast<float>(M * N);
 
-    // Reporting
-    double total_ops = 2.0 * M * N * K;
-    double gops_f32  = (total_ops / time_f32.count()) / 1e9;
-    double gops_int8 = (total_ops / time_int8.count()) / 1e9;
-    double speedup   = gops_int8 / gops_f32;
+    const double total_ops = 2.0 * M * N * K;
+    const double gops_f32 = (total_ops / time_f32) / 1e9;
+    const double gops_q    = (total_ops / time_q) / 1e9;
+    const double speedup   = gops_q / gops_f32;
+    const float rel_max_pct = (max_ref_abs > 0.0f) ? (max_abs_err / max_ref_abs * 100.0f) : 0.0f;
 
-    std::cout << "======================================================\n"
-              << "       ARM64 NEON QUANTIZED GEMM BENCHMARK\n"
-              << "======================================================\n"
-              << "Matrix Dimensions    : " << M << " x " << K << " x " << N << "\n"
-              << "Total Arithmetic Ops : " << static_cast<long long>(total_ops) << "\n\n"
-              << "[1] NAIVE SCALAR FLOAT32 ENGINE\n"
-              << std::fixed << std::setprecision(3)
-              << "Execution Time       : " << time_f32.count() << " seconds\n"
-              << std::setprecision(2)
-              << "Performance          : " << gops_f32 << " GOPS\n\n"
-              << "[2] OPTIMIZED INT8 NEON SIMD ENGINE\n"
-              << std::setprecision(3)
-              << "Execution Time       : " << time_int8.count() << " seconds\n"
-              << std::setprecision(2)
-              << "Performance          : " << gops_int8 << " GOPS\n"
-              << "Speedup Factor       : " << speedup << "x\n\n"
-              << "[3] CORRECTNESS VERIFICATION\n"
-              << std::setprecision(4)
-              << "Max Absolute Error   : " << max_abs_err << "\n"
-              << "Status               : " << (rel_err_pct < 5.0f ? "PASSED" : "FAILED")
-              << " (Precision Loss < 5%)\n"
-              << "======================================================\n";
+    std::cout << "======================================================\n";
+    std::cout << "     ARM64 NEON BLOCKED INT8 GEMM BENCHMARK\n";
+    std::cout << "======================================================\n";
+    std::cout << "Matrix Dimensions    : " << M << " x " << K << " x " << N << "\n";
+    std::cout << "K Block Size         : " << K_BLOCK << "\n";
+    std::cout << "Threads Used         : " << num_threads << "\n";
+    std::cout << "Total Arithmetic Ops  : " << static_cast<long long>(total_ops) << "\n\n";
 
-    free(A_int8); free(B_int8); free(B_int8_T);
-    free(A_packed); free(B_packed);
+    std::cout << "[1] NAIVE SCALAR FLOAT32 ENGINE\n";
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Execution Time       : " << time_f32 << " seconds\n";
+    std::cout << std::setprecision(2);
+    std::cout << "Performance          : " << gops_f32 << " GOPS\n\n";
+
+    std::cout << "[2] BLOCKED INT8 NEON SIMD ENGINE\n";
+    std::cout << std::setprecision(3);
+    std::cout << "Execution Time       : " << time_q << " seconds\n";
+    std::cout << std::setprecision(2);
+    std::cout << "Performance          : " << gops_q << " GOPS\n";
+    std::cout << "Speedup Factor       : " << speedup << "x\n\n";
+
+    std::cout << "[3] CORRECTNESS VERIFICATION\n";
+    std::cout << std::setprecision(6);
+    std::cout << "Max Absolute Error   : " << max_abs_err << "\n";
+    std::cout << "Mean Absolute Error  : " << mean_abs_err << "\n";
+    std::cout << "Max Ref Abs Value    : " << max_ref_abs << "\n";
+    std::cout << "Status               : " << ((max_abs_err <= 0.05f) ? "PASSED" : "FAILED")
+              << " (Target Max Abs Error <= 0.05)\n";
+    std::cout << "======================================================\n";
+
     return 0;
 }
+```
