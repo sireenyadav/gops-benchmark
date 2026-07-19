@@ -9,17 +9,12 @@
 
 constexpr int M = 1024, K = 1024, N = 1024;
 
-// ----------------------------------------------------------------------
-// Fill matrix with uniform random floats in [-1, 1]
-// ----------------------------------------------------------------------
 void init_matrix(std::vector<float>& mat, int size) {
     for (int i = 0; i < size; ++i)
         mat[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) * 2.0f - 1.0f;
 }
 
-// ----------------------------------------------------------------------
-// Path A: naive float32 GEMM (unchanged)
-// ----------------------------------------------------------------------
+// Naive float32 (unchanged)
 void gemm_float32(const std::vector<float>& A, const std::vector<float>& B,
                   std::vector<float>& C) {
     for (int i = 0; i < M; ++i)
@@ -31,9 +26,7 @@ void gemm_float32(const std::vector<float>& A, const std::vector<float>& B,
         }
 }
 
-// ----------------------------------------------------------------------
-// Per‑row quantization of A -> scale per row, stores quantized int8
-// ----------------------------------------------------------------------
+// ----- Per-row quantization of A (row scales) -----
 void quantize_A_per_row(const std::vector<float>& A, int8_t* A_int8,
                         std::vector<float>& scales_A) {
     for (int i = 0; i < M; ++i) {
@@ -52,12 +45,9 @@ void quantize_A_per_row(const std::vector<float>& A, int8_t* A_int8,
     }
 }
 
-// ----------------------------------------------------------------------
-// Per‑column quantization of B (B is KxN, column‑major view)
-// ----------------------------------------------------------------------
+// ----- Per-column quantization of B (column scales) -----
 void quantize_B_per_column(const std::vector<float>& B, int8_t* B_int8,
                            std::vector<float>& scales_B) {
-    // B stored row‑major: B[row * N + col]
     for (int j = 0; j < N; ++j) {
         float max_abs = 0.0f;
         for (int k = 0; k < K; ++k)
@@ -73,9 +63,7 @@ void quantize_B_per_column(const std::vector<float>& B, int8_t* B_int8,
     }
 }
 
-// ----------------------------------------------------------------------
-// Pack A for vdotq: replicate each 4-byte group 4 times
-// ----------------------------------------------------------------------
+// ----- Pack A: replicate each 4-byte group 4 times (for 4 outputs per vdotq) -----
 void pack_A_vdot(const int8_t* A, int8_t* A_packed) {
     for (int i = 0; i < M; ++i) {
         const int8_t* src = A + i * K;
@@ -89,14 +77,11 @@ void pack_A_vdot(const int8_t* A, int8_t* A_packed) {
     }
 }
 
-// ----------------------------------------------------------------------
-// Pack B (transposed B_T of shape [N][K]) for vdotq:
-// interleave 4 columns per k‑block of 4
-// ----------------------------------------------------------------------
+// ----- Pack B: interleave 4 columns per k-block of 4 bytes -----
 void pack_B_vdot(const int8_t* B_T, int8_t* B_packed) {
-    constexpr int JG = N / 4;   // number of column groups of 4
+    constexpr int JG = N / 4;
     for (int jg = 0; jg < JG; ++jg) {
-        int8_t* dst = B_packed + jg * (K * 4);   // 4*K bytes per group
+        int8_t* dst = B_packed + jg * (K * 4);
         for (int k0 = 0; k0 < K; k0 += 4) {
             for (int jj = 0; jj < 4; ++jj) {
                 const int8_t* col = B_T + (jg * 4 + jj) * K + k0;
@@ -107,22 +92,21 @@ void pack_B_vdot(const int8_t* B_T, int8_t* B_packed) {
     }
 }
 
-// ----------------------------------------------------------------------
 int main() {
-    srand(42);   // reproducible
+    srand(42);   // fixed seed, reproducible
 
     std::vector<float> A(M * K), B(K * N);
     std::vector<float> C_float(M * N, 0.0f), C_quant(M * N, 0.0f);
     init_matrix(A, M * K);
     init_matrix(B, K * N);
 
-    // ---------------------- Path A: baseline ------------------------------
+    // Path A – baseline
     auto t0 = std::chrono::steady_clock::now();
     gemm_float32(A, B, C_float);
     auto t1 = std::chrono::steady_clock::now();
     std::chrono::duration<double> time_f32 = t1 - t0;
 
-    // ---------------- Quantize with per‑row/column scales -----------------
+    // Quantize with per-row/column scales
     int8_t *A_int8 = nullptr, *B_int8 = nullptr, *B_int8_T = nullptr;
     posix_memalign(reinterpret_cast<void**>(&A_int8), 64, M * K);
     posix_memalign(reinterpret_cast<void**>(&B_int8), 64, K * N);
@@ -132,27 +116,26 @@ int main() {
     quantize_A_per_row(A, A_int8, row_scales_A);
     quantize_B_per_column(B, B_int8, col_scales_B);
 
-    // Transpose B_int8 (KxN -> NxK) for packing
+    // Transpose B (KxN -> NxK)
     for (int i = 0; i < K; ++i)
         for (int j = 0; j < N; ++j)
             B_int8_T[j * K + i] = B_int8[i * N + j];
 
-    // Pack for efficient vdotq usage
+    // Pack matrices
     int8_t *A_packed = nullptr, *B_packed = nullptr;
     posix_memalign(reinterpret_cast<void**>(&A_packed), 64, M * K * 4);
     posix_memalign(reinterpret_cast<void**>(&B_packed), 64, N * K);
     pack_A_vdot(A_int8, A_packed);
     pack_B_vdot(B_int8_T, B_packed);
 
-    // ---------------------- Path B: accelerated NEON ----------------------
+    // Path B – accelerated NEON
     auto t2 = std::chrono::steady_clock::now();
 
-    constexpr int IBLOCK = 4;                 // 4 rows of A at once
-    constexpr int JG = N / 4;                 // 4 columns of B at once
+    constexpr int IBLOCK = 4;   // 4 rows of A at once
+    constexpr int JG = N / 4;   // groups of 4 columns
 
     for (int i = 0; i < M; i += IBLOCK) {
         for (int jg = 0; jg < JG; ++jg) {
-            // Accumulators for 4 rows × 4 columns
             int32x4_t c0 = vdupq_n_s32(0);
             int32x4_t c1 = vdupq_n_s32(0);
             int32x4_t c2 = vdupq_n_s32(0);
@@ -164,7 +147,7 @@ int main() {
             const int8_t* a2 = A_packed + (i + 2) * (K * 4);
             const int8_t* a3 = A_packed + (i + 3) * (K * 4);
 
-            // k loop unrolled by 2 to hide vdotq latency
+            // k‑loop unrolled by 2
             for (int k_block = 0; k_block < K / 4; k_block += 2) {
                 int8x16_t b0 = vld1q_s8(b_base + (k_block + 0) * 16);
                 int8x16_t b1 = vld1q_s8(b_base + (k_block + 1) * 16);
@@ -190,36 +173,36 @@ int main() {
                 c3 = vdotq_s32(c3, a31, b1);
             }
 
-            // De‑quantize and store: C_quant[i+row][jg*4+col] = sum * row_scale * col_scale
+            // De‑quantize with per‑row/column scales and store
             int32_t res[4];
             float* c_out = C_quant.data();
-            float r_scale0 = row_scales_A[i + 0];
-            float r_scale1 = row_scales_A[i + 1];
-            float r_scale2 = row_scales_A[i + 2];
-            float r_scale3 = row_scales_A[i + 3];
+            float rs0 = row_scales_A[i + 0];
+            float rs1 = row_scales_A[i + 1];
+            float rs2 = row_scales_A[i + 2];
+            float rs3 = row_scales_A[i + 3];
 
             vst1q_s32(res, c0);
             for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 0) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * r_scale0 * col_scales_B[jg * 4 + jj];
+                c_out[(i + 0) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs0 * col_scales_B[jg * 4 + jj];
 
             vst1q_s32(res, c1);
             for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 1) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * r_scale1 * col_scales_B[jg * 4 + jj];
+                c_out[(i + 1) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs1 * col_scales_B[jg * 4 + jj];
 
             vst1q_s32(res, c2);
             for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 2) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * r_scale2 * col_scales_B[jg * 4 + jj];
+                c_out[(i + 2) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs2 * col_scales_B[jg * 4 + jj];
 
             vst1q_s32(res, c3);
             for (int jj = 0; jj < 4; ++jj)
-                c_out[(i + 3) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * r_scale3 * col_scales_B[jg * 4 + jj];
+                c_out[(i + 3) * N + jg * 4 + jj] = static_cast<float>(res[jj]) * rs3 * col_scales_B[jg * 4 + jj];
         }
     }
 
     auto t3 = std::chrono::steady_clock::now();
     std::chrono::duration<double> time_int8 = t3 - t2;
 
-    // ---------------------- Verification ---------------------------------
+    // Verification
     float max_abs_err = 0.0f, max_c_val = 0.0f;
     for (int i = 0; i < M * N; ++i) {
         float err = std::abs(C_float[i] - C_quant[i]);
@@ -228,7 +211,7 @@ int main() {
     }
     float rel_err_pct = (max_abs_err / max_c_val) * 100.0f;
 
-    // ---------------------- Reporting ------------------------------------
+    // Reporting
     double total_ops = 2.0 * M * N * K;
     double gops_f32  = (total_ops / time_f32.count()) / 1e9;
     double gops_int8 = (total_ops / time_int8.count()) / 1e9;
