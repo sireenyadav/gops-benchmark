@@ -327,7 +327,7 @@ int main() {
     double speedup   = gops_int8 / gops_f32;
 
     std::cout << "======================================================\n"
-              << "       ARM64 NEON QUANTIZED GEMM BENCHMARK\n"
+              << "       ARM64 NEON QUANTIZED GEMM  Z BENCHMARK\n"
               << "======================================================\n"
               << "Matrix Dimensions    : " << M << " x " << K << " x " << N << "\n"
               << "Total Arithmetic Ops : " << static_cast<long long>(total_ops) << "\n\n"
